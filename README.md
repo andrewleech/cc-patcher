@@ -48,6 +48,23 @@ removing a provider invalidates the cache.
 Exit codes: `0` all patches applied, `2` some patches missed (partial),
 `1` fatal (validation conflict, parse failure, I/O error).
 
+## Supported providers
+
+Two provider packages are actively maintained against this engine:
+
+- **[claude-net-patcher](https://github.com/andrewleech/claude-net/tree/main/patcher-ext)**
+  — channel-unlock patches (development channels, org-policy and allowlist
+  bypass, dynamic-workflows gate). Ships inside the claude-net repo under
+  `patcher-ext/`, so it installs from that subdirectory.
+- **[cc-local-router](https://github.com/andrewleech/cc-local-router)** —
+  model-splitter patches: registers a custom model alias and forces the
+  availability gate, paired with a proxy that routes that alias to a local
+  inference server.
+
+Install either or both with `--with` (see above). They are independent —
+neither needs to know the other is present — and `uv tool upgrade cc-patcher`
+refreshes every installed provider without dropping any.
+
 ## Writing a provider
 
 A provider exports a module-level list of `Patch`-shaped objects and
