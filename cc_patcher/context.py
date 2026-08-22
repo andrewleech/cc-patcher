@@ -12,9 +12,9 @@ EditPlan it:
   3. Rewrites all affected StringPointer offsets/lengths against the
      pre-splice snapshot held in `ctx.bun`, so multiple inserts into
      the same region don't double-count.
-  4. Rewrites Offsets struct, payload_len prefix, .bun sh_size,
-     covering LOAD's p_filesz/p_memsz, sh_offset/p_offset for
-     sections past .bun, and e_shoff.
+  4. Rewrites the Offsets struct, the payload_len prefix, and the
+     container headers describing the payload section — see
+     `_rewrite_elf_headers` / `_rewrite_macho_headers`.
 
 The whole 244 MB buffer is held exactly once. Patches read from it
 via `find_*` helpers during discover; the applier writes to it during
@@ -25,15 +25,19 @@ import dataclasses
 import re
 import struct
 
+from . import binfmt as _binfmt
 from . import bun as _bun
 from . import elf as _elf
+from . import macho as _macho
 from .edits import Edit, EditPlan, StringPointerRef
+
+ContainerLayout = _elf.ElfLayout | _macho.MachOLayout
 
 
 @dataclasses.dataclass(frozen=True)
 class DiscoveryContext:
     buf: bytearray
-    elf: _elf.ElfLayout
+    layout: ContainerLayout
     bun: _bun.BunFraming
     version: str
     _sp_index: dict[StringPointerRef, _bun.StringPtr]
@@ -138,11 +142,14 @@ def _build_sp_index(
 
 
 def parse(buf: bytearray, version: str = "unknown") -> DiscoveryContext:
-    elf_layout = _elf.parse(buf)
-    bun_framing = _bun.locate(buf, elf_layout)
+    fmt = _binfmt.sniff(buf)
+    layout: ContainerLayout = (
+        _elf.parse(buf) if fmt == _binfmt.FORMAT_ELF else _macho.parse(buf)
+    )
+    bun_framing = _bun.locate(buf, layout)
     return DiscoveryContext(
         buf=buf,
-        elf=elf_layout,
+        layout=layout,
         bun=bun_framing,
         version=version,
         _sp_index=_build_sp_index(bun_framing),
@@ -170,7 +177,10 @@ class EditApplier:
         total_delta = sum(e.delta for e in growable)
         self._rewrite_string_pointers(growable)
         self._rewrite_bun_framing(growable, total_delta)
-        self._rewrite_elf_headers(total_delta)
+        if isinstance(self.ctx.layout, _macho.MachOLayout):
+            self._rewrite_macho_headers(total_delta)
+        else:
+            self._rewrite_elf_headers(total_delta)
         return self.buf
 
     def _verify_and_splice(self, offset: int, old: bytes, new: bytes) -> None:
@@ -220,7 +230,7 @@ class EditApplier:
         payload_start = bun.payload_start
 
         struct.pack_into(
-            "<Q", self.buf, bun.bun_sh_offset, bun.payload_len + total_delta,
+            "<Q", self.buf, bun.bun_offset, bun.payload_len + total_delta,
         )
 
         new_offsets_pos = (
@@ -247,9 +257,9 @@ class EditApplier:
         )
 
     def _rewrite_elf_headers(self, total_delta: int) -> None:
-        elf = self.ctx.elf
-        bun_sh_offset = self.ctx.bun.bun_sh_offset
-        bun_sh_size = self.ctx.bun.bun_sh_size
+        elf = self.ctx.layout
+        bun_sh_offset = self.ctx.bun.bun_offset
+        bun_sh_size = self.ctx.bun.bun_size
 
         shdr_table_shift = total_delta if elf.e_shoff > bun_sh_offset else 0
 
@@ -293,3 +303,103 @@ class EditApplier:
                 "<Q", self.buf, _elf.EHDR_SHOFF_OFFSET,
                 elf.e_shoff + total_delta,
             )
+
+    def _rewrite_macho_headers(self, total_delta: int) -> None:
+        """Absorb the inserted bytes into the zero padding that aligns
+        `__LINKEDIT`, growing `__BUN` by whole pages only if the padding
+        is too small.
+
+        dyld requires every segment's `fileoff` and `vmaddr` to be
+        page-aligned and to keep a constant difference, so `__LINKEDIT`
+        can only move by a multiple of the page size. Consuming the
+        padding instead keeps it still: for the edit sizes the current
+        patches emit (tens of bytes against ~2 KB of padding on
+        average) nothing after `__BUN` moves at all.
+        """
+        mo = self.ctx.layout
+        bun = self.ctx.bun
+        seg = mo.segment_by_name(_macho.BUN_SEGNAME)
+
+        payload_region_end = bun.bun_offset + bun.bun_size
+        pad = seg.file_end - payload_region_end
+        if pad < 0:
+            raise RuntimeError(
+                f"__bun section (ends at {payload_region_end}) overruns the "
+                f"__BUN segment (ends at {seg.file_end})"
+            )
+
+        grow = (
+            0 if total_delta <= pad
+            else _round_up(total_delta - pad, mo.page_size)
+        )
+        new_pad = pad + grow - total_delta
+
+        pad_start = payload_region_end + total_delta
+        existing = self.buf[pad_start:pad_start + pad]
+        if len(existing) != pad:
+            raise RuntimeError(
+                f"__BUN segment claims to end at {seg.file_end} but the file "
+                f"is only {len(self.buf) - total_delta} bytes"
+            )
+        if any(existing):
+            raise RuntimeError(
+                f"expected {pad} zero padding bytes after the Bun payload at "
+                f"0x{pad_start:x}, found non-zero data"
+            )
+        self.buf[pad_start:pad_start + pad] = b"\0" * new_pad
+
+        struct.pack_into(
+            "<Q", self.buf,
+            mo.bun_section_header_offset() + _macho.SECT_SIZE_OFFSET,
+            bun.bun_size + total_delta,
+        )
+
+        if grow == 0:
+            return
+
+        lc = seg.file_offset_of_lc
+        struct.pack_into(
+            "<Q", self.buf, lc + _macho.SEG_FILESIZE_OFFSET,
+            seg.filesize + grow,
+        )
+        struct.pack_into(
+            "<Q", self.buf, lc + _macho.SEG_VMSIZE_OFFSET,
+            seg.vmsize + grow,
+        )
+
+        for other in mo.segments:
+            if other.index == seg.index or other.fileoff < seg.file_end:
+                continue
+            other_lc = other.file_offset_of_lc
+            struct.pack_into(
+                "<Q", self.buf, other_lc + _macho.SEG_FILEOFF_OFFSET,
+                other.fileoff + grow,
+            )
+            struct.pack_into(
+                "<Q", self.buf, other_lc + _macho.SEG_VMADDR_OFFSET,
+                other.vmaddr + grow,
+            )
+            for sect in other.sections:
+                struct.pack_into(
+                    "<Q", self.buf,
+                    sect.file_offset_of_sect + _macho.SECT_ADDR_OFFSET,
+                    sect.addr + grow,
+                )
+                if sect.offset:
+                    struct.pack_into(
+                        "<I", self.buf,
+                        sect.file_offset_of_sect + _macho.SECT_OFFSET_OFFSET,
+                        sect.offset + grow,
+                    )
+
+        for field in mo.file_offset_fields:
+            if field.value == 0 or field.value < seg.file_end:
+                continue
+            struct.pack_into(
+                "<I" if field.width == 4 else "<Q", self.buf,
+                field.file_offset, field.value + grow,
+            )
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple

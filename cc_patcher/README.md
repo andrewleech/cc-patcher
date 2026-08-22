@@ -6,14 +6,18 @@ engine only -- it ships no patches of its own. Patch definitions come from
 separately-installed provider packages that register entries in the
 `cc_patcher.patches` importlib.metadata entry-point group.
 
-Does ELF/Bun header surgery so growable edits work -- needed for injecting
-new entries into arrays and new arms into switch statements, not just
-byte-swap-in-place replacements.
+Does container/Bun header surgery so growable edits work -- needed for
+injecting new entries into arrays and new arms into switch statements, not
+just byte-swap-in-place replacements.
 
 ## Prereqs
 
 - Python 3.11+, stdlib only
-- Linux x86-64, ELF64 little-endian only for now
+- Linux (ELF64) or macOS (64-bit Mach-O), little-endian
+- macOS additionally needs `codesign` (ships with the Command Line Tools):
+  splicing bytes invalidates Apple's signature, so patched binaries are
+  re-signed ad-hoc. Universal (fat) binaries are rejected -- run
+  `lipo -thin` first.
 
 ## Quick start
 
@@ -62,11 +66,33 @@ Exit codes from a patch run (`cc-patcher <src> <dst>`, and internally from
 `resolve_patched_binary()`):
 
 - `0` -- all discovered patches matched and applied
-- `1` -- fatal error (validation conflict, ELF/Bun parse failure, I/O
+- `1` -- fatal error (validation conflict, container/Bun parse failure, I/O
   failure); `resolve_patched_binary()` falls back to the unpatched binary
 - `2` -- partial success, some patches missed (diagnostics printed);
   `resolve_patched_binary()` falls back to the previous cached patched
   binary if one exists, otherwise proceeds with the partial result
+
+## macOS specifics
+
+Growable edits on Mach-O are absorbed into the zero padding that aligns
+`__LINKEDIT` to a page boundary, so nothing after `__BUN` moves and the
+file size is unchanged. Only if the inserted bytes exceed that padding
+does `__BUN` grow by whole pages, shifting `fileoff` and `vmaddr` of
+every later segment plus every load-command field pointing into
+`__LINKEDIT`. dyld requires each segment's `fileoff` and `vmaddr` to be
+page-aligned and to keep a constant difference, which is why the growth
+step is page-quantised.
+
+`macho.py` refuses load commands it doesn't recognise rather than
+risk leaving an unknown file-offset field stale -- a stale offset
+silently corrupts the binary, whereas failing loudly just falls back to
+the unpatched one.
+
+Patched binaries are re-signed ad-hoc with the original identifier,
+entitlements and runtime flags preserved. The identifier matters:
+`codesign` otherwise derives it from the output filename, which would
+give the cached binary a new code identity on every build and re-trigger
+every TCC permission prompt.
 
 ## When a provider's anchor stops matching
 
@@ -85,7 +111,9 @@ cc_patcher/
   cli.py            orchestrator, argparse, summary printing, cache-key,
                      --list-patches / --list-providers
   launch.py          binary resolution + patch caching + `launch` subcommand
+  binfmt.py         container-format sniffing + the BunSection abstraction
   elf.py            ELF64 read: headers, sections, segments
+  macho.py          Mach-O read: segments, sections, file-offset fields
   bun.py            Bun payload framing: trailer, Offsets struct, modules table
   edits.py          Edit dataclass, EditPlan, validation
   context.py        DiscoveryContext (view for patches) + EditApplier (owns the buffer)

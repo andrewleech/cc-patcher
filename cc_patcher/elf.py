@@ -12,6 +12,8 @@ headers because the Bun standalone loader walks them to find `.bun`.
 import dataclasses
 import struct
 
+from .binfmt import BunSection
+
 ELF64_EHDR_STRUCT = struct.Struct("<16sHHIQQQIHHHHHH")
 ELF64_PHDR_STRUCT = struct.Struct("<IIQQQQQQ")
 ELF64_SHDR_STRUCT = struct.Struct("<IIQQQQIIQQ")
@@ -26,6 +28,7 @@ SHDR_OFFSET_OFFSET = 24
 SHDR_SIZE_OFFSET = 32
 
 ELF_MAGIC = b"\x7fELF"
+BUN_SECTION_NAME = b".bun"
 
 
 class ElfFormatError(Exception):
@@ -69,6 +72,10 @@ class ElfLayout:
             if s.name == name:
                 return s
         raise ElfFormatError(f"section {name!r} not found")
+
+    def bun_section(self) -> BunSection:
+        s = self.section_by_name(BUN_SECTION_NAME)
+        return BunSection(index=s.index, offset=s.sh_offset, size=s.sh_size)
 
 
 def parse(buf: bytes) -> ElfLayout:

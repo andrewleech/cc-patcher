@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cc-patcher"
 version = "0.1.0"
-description = "Reusable ELF/Bun-aware patcher engine for the Claude Code binary, with a plugin entry-point contract for provider-supplied patches."
+description = "Reusable ELF/Mach-O/Bun-aware patcher engine for the Claude Code binary, with a plugin entry-point contract for provider-supplied patches."
 readme = "cc_patcher/README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

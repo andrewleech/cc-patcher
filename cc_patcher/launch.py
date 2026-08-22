@@ -20,11 +20,11 @@ partially-patched result.
 
 import os
 import shutil
-import subprocess
 import sys
 from hashlib import sha256
 from pathlib import Path
 
+from . import binfmt as _binfmt
 from .cli import _print_summary, run_patcher
 from .patches import PATCHES
 
@@ -46,22 +46,25 @@ def _resolve_existing(path: Path) -> Path | None:
     return None
 
 
-def _looks_like_elf(path: Path) -> bool:
+def _looks_like_native_binary(path: Path) -> bool:
+    """True if `path` is an ELF or 64-bit Mach-O executable — i.e. a
+    Bun-compiled binary the patcher can read, not a shell/JS wrapper."""
     try:
         with open(path, "rb") as f:
-            return f.read(4) == b"\x7fELF"
+            magic = f.read(4)
     except OSError:
         return False
+    return magic in (_binfmt.ELF_MAGIC, _binfmt.MACHO_MAGIC_64)
 
 
 def find_claude_binary(cli_path_env: str | None = None) -> Path:
-    """Locate the real Claude Code ELF binary.
+    """Locate the real Claude Code native binary.
 
     Checks `CLAUDE_CLI_PATH` first, then well-known native-install
-    locations, then PATH resolution. PATH resolution rejects non-ELF
-    matches (e.g. the npm launcher's `cli.js` wrapper script) with a
-    clear error instead of letting the patcher fail on "no anchor
-    strings found".
+    locations, then PATH resolution. PATH resolution rejects
+    non-native matches (e.g. the npm launcher's `cli.js` wrapper
+    script) with a clear error instead of letting the patcher fail on
+    "no anchor strings found".
     """
     env_value = (
         cli_path_env if cli_path_env is not None
@@ -81,14 +84,14 @@ def find_claude_binary(cli_path_env: str | None = None) -> Path:
 
     for candidate in candidates:
         resolved = _resolve_existing(candidate)
-        if resolved and resolved.is_file() and _looks_like_elf(resolved):
+        if resolved and resolved.is_file() and _looks_like_native_binary(resolved):
             return resolved
 
     which = shutil.which("claude")
     if which:
         resolved = _resolve_existing(Path(which))
         if resolved and resolved.is_file():
-            if _looks_like_elf(resolved):
+            if _looks_like_native_binary(resolved):
                 return resolved
             raise BinaryNotFoundError(
                 f"$PATH 'claude' resolves to {resolved}, which is not the "
@@ -126,37 +129,6 @@ def binary_cache_key(binary: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def _codesign(path: Path) -> None:
-    """macOS only: in-place byte patches invalidate Apple's code
-    signature, and AMFI then silently kills the binary at exec. Ad-hoc
-    re-sign with preserved entitlements so Bun's JIT / dylib loading
-    still works."""
-    if shutil.which("codesign") is None:
-        return
-    result = subprocess.run(
-        [
-            "codesign", "--force",
-            "--preserve-metadata=entitlements,requirements,flags,runtime",
-            "--sign", "-", str(path),
-        ],
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        return
-    # Some binaries lack enough metadata to preserve -- fall back to a
-    # bare ad-hoc sign.
-    result = subprocess.run(
-        ["codesign", "--force", "--sign", "-", str(path)],
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        print(
-            "WARN: codesign failed -- macOS AMFI may kill the patched "
-            "binary at exec.",
-            file=sys.stderr,
-        )
-
-
 def resolve_patched_binary(cli_path_env: str | None = None) -> Path:
     """Return the path to a cached, patched Claude Code binary,
     patching and caching it first if this binary+registry combination
@@ -182,8 +154,8 @@ def resolve_patched_binary(cli_path_env: str | None = None) -> Path:
         try:
             summary = run_patcher(src, versioned)
         except (SystemExit, Exception) as exc:
-            # Any failure here (validation conflict, ELF/Bun parse
-            # error, I/O failure) is fatal to this patch attempt --
+            # Any failure here (validation conflict, container/Bun
+            # parse error, I/O failure) is fatal to this patch attempt --
             # same bucket as exit code 1 from the standalone CLI.
             print(f"[cc-patcher] {exc}", file=sys.stderr)
             versioned.unlink(missing_ok=True)
@@ -213,8 +185,6 @@ def resolve_patched_binary(cli_path_env: str | None = None) -> Path:
                     )
 
         if versioned != src:
-            if sys.platform == "darwin":
-                _codesign(versioned)
             for old in cdir.glob("claude-patched-*"):
                 if old.name != versioned.name:
                     old.unlink(missing_ok=True)

@@ -1,6 +1,7 @@
 """Bun standalone-payload framing.
 
-Layout inside `.bun`:
+Layout inside the payload section (`.bun` on ELF, `__BUN,__bun` on
+Mach-O):
 
   [u64 payload_len][payload bytes][Offsets struct (32B)][TRAILER (16B)]
 
@@ -21,8 +22,9 @@ Layout references:
 
 import dataclasses
 import struct
+import typing
 
-from . import elf as _elf
+from .binfmt import BunSection
 
 TRAILER = b"\n---- Bun! ----\n"
 OFFSETS_STRUCT = struct.Struct("<QIIIIII")
@@ -77,11 +79,19 @@ class ModuleRecord:
         return self.base + MODULE_FIELD_NAMES.index(field_name) * 8
 
 
+class BunContainer(typing.Protocol):
+    """The container-format surface `locate()` needs: where the Bun
+    payload section is. Implemented by `elf.ElfLayout` and
+    `macho.MachOLayout`."""
+
+    def bun_section(self) -> BunSection: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class BunFraming:
     bun_section_idx: int
-    bun_sh_offset: int
-    bun_sh_size: int
+    bun_offset: int
+    bun_size: int
     payload_start: int
     payload_len: int
     trailer_offset: int
@@ -94,15 +104,15 @@ class BunFraming:
     modules: tuple[ModuleRecord, ...]
 
 
-def locate(buf: bytes, elf: _elf.ElfLayout) -> BunFraming:
-    bun = elf.section_by_name(b".bun")
-    payload_len = struct.unpack_from("<Q", buf, bun.sh_offset)[0]
-    if payload_len != bun.sh_size - 8:
+def locate(buf: bytes, container: BunContainer) -> BunFraming:
+    bun = container.bun_section()
+    payload_len = struct.unpack_from("<Q", buf, bun.offset)[0]
+    if payload_len != bun.size - 8:
         raise BunFormatError(
-            f"payload_len {payload_len} != sh_size - 8 ({bun.sh_size - 8})"
+            f"payload_len {payload_len} != section size - 8 ({bun.size - 8})"
         )
 
-    payload_start = bun.sh_offset + 8
+    payload_start = bun.offset + 8
     payload_end = payload_start + payload_len
     trailer_offset = payload_end - len(TRAILER)
     if buf[trailer_offset:payload_end] != TRAILER:
@@ -142,8 +152,8 @@ def locate(buf: bytes, elf: _elf.ElfLayout) -> BunFraming:
 
     return BunFraming(
         bun_section_idx=bun.index,
-        bun_sh_offset=bun.sh_offset,
-        bun_sh_size=bun.sh_size,
+        bun_offset=bun.offset,
+        bun_size=bun.size,
         payload_start=payload_start,
         payload_len=payload_len,
         trailer_offset=trailer_offset,

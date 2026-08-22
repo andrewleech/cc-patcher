@@ -2,7 +2,9 @@
 
 Binary patcher for the Bun-compiled Claude Code executable. Applies
 same-length and growable edits to the embedded bundle and fixes up the
-ELF / Bun framing so the result still boots.
+container / Bun framing so the result still boots. Handles Linux (ELF64)
+and macOS (64-bit Mach-O) binaries; the same provider patches apply to
+both, since the embedded Bun payload is identical across platforms.
 
 The engine ships **no patches of its own**. Patch definitions come from
 provider packages that register a `cc_patcher.patches` entry point;

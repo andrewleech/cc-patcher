@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import context as _context
 from . import diagnostics as _diagnostics
+from . import macho as _macho
 from .edits import EditPlan, PatchConflictError, RegionError
 from .patches import PATCHES, discover_entry_points
 
@@ -65,6 +66,50 @@ def _capture_version(path: Path) -> str:
         return out.split("\n", 1)[0] if out else "unknown"
     except Exception:
         return "unknown"
+
+
+def _codesign(path: Path) -> None:
+    """Re-sign a patched Mach-O binary.
+
+    Splicing bytes invalidates Apple's code signature: the
+    CodeDirectory holds a SHA-256 per page. A quarantined or
+    Gatekeeper-launched binary is refused outright, and a
+    hardened-runtime one loses the entitlements Bun's JIT needs, so
+    re-sign ad-hoc with the original entitlements and runtime flags
+    preserved. `codesign` recomputes the whole CodeDirectory itself.
+    """
+    if shutil.which("codesign") is None:
+        print(
+            "WARN: codesign not found -- the patched binary carries an "
+            "invalid signature.",
+            file=sys.stderr,
+        )
+        return
+    attempts = [
+        # `identifier` matters: codesign otherwise derives it from the
+        # output filename, so the cached `claude-patched-<hash>` would
+        # get a new code identity on every build and macOS would
+        # re-prompt for each TCC permission the CLI has been granted.
+        # `requirements` is deliberately absent -- the original names
+        # Anthropic's Developer ID team, which an ad-hoc signature
+        # cannot satisfy.
+        ["--preserve-metadata=identifier,entitlements,flags,runtime"],
+        # A binary with too little metadata to preserve still runs
+        # unsigned-ad-hoc, just without the hardened-runtime niceties.
+        [],
+    ]
+    for extra in attempts:
+        result = subprocess.run(
+            ["codesign", "--force", *extra, "--sign", "-", str(path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return
+    print(
+        f"WARN: codesign failed ({result.stderr.strip()}) -- macOS may "
+        f"refuse to exec the patched binary.",
+        file=sys.stderr,
+    )
 
 
 def run_patcher(src: Path, dst: Path) -> PatchRunSummary:
@@ -122,6 +167,8 @@ def run_patcher(src: Path, dst: Path) -> PatchRunSummary:
 
     dst.write_bytes(new_buf)
     shutil.copymode(src, dst)
+    if isinstance(ctx.layout, _macho.MachOLayout):
+        _codesign(dst)
 
     return PatchRunSummary(
         version=version,
