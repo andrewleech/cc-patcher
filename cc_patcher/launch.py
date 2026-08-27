@@ -110,8 +110,26 @@ def cache_dir() -> Path:
     return d
 
 
+def engine_cache_key() -> str:
+    """Hash of this installed `cc_patcher` package's own `.py` source.
+
+    Folded into `registry_cache_key()` so an engine upgrade (e.g. a fix
+    to `EditApplier`'s edit-application semantics) invalidates cached
+    patched binaries even when the discovered patch registry -- whose
+    `cache_key()`s only cover each patch's own anchor/replacement --
+    is unchanged."""
+    pkg_dir = Path(__file__).resolve().parent
+    h = sha256()
+    for path in sorted(pkg_dir.rglob("*.py")):
+        h.update(str(path.relative_to(pkg_dir)).encode())
+        h.update(b"\0")
+        h.update(path.read_bytes())
+    return h.hexdigest()
+
+
 def registry_cache_key() -> str:
     h = sha256()
+    h.update(engine_cache_key().encode())
     for patch in PATCHES:
         h.update(patch.cache_key().encode())
         h.update(b"\n")

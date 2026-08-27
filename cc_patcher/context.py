@@ -164,11 +164,20 @@ class EditApplier:
     def apply(self, plan: EditPlan) -> bytearray:
         plan.validate(self.ctx)
 
+        touched_modules = {
+            ref.index for ref in (
+                self.ctx.containing_string_pointer(e.offset)
+                for e in plan.edits
+            )
+            if ref is not None and ref.kind == "module"
+        }
+
         for e in plan.same_length():
             self._verify_and_splice(e.offset, e.old, e.new)
 
         growable = sorted(plan.growable(), key=lambda e: -e.offset)
         if not growable:
+            self._invalidate_bytecode(touched_modules, growable)
             return self.buf
 
         for e in growable:
@@ -176,6 +185,7 @@ class EditApplier:
 
         total_delta = sum(e.delta for e in growable)
         self._rewrite_string_pointers(growable)
+        self._invalidate_bytecode(touched_modules, growable)
         self._rewrite_bun_framing(growable, total_delta)
         if isinstance(self.ctx.layout, _macho.MachOLayout):
             self._rewrite_macho_headers(total_delta)
@@ -190,6 +200,27 @@ class EditApplier:
                 f"splice at 0x{offset:x}: expected {old!r}, found {actual!r}"
             )
         self.buf[offset:offset + len(old)] = new
+
+    def _invalidate_bytecode(
+        self, module_indices: set[int], growable: list[Edit],
+    ) -> None:
+        """Zero a patched module's JSC bytecode-cache StringPointer.
+
+        Bun's standalone runtime runs a module's cached bytecode in
+        preference to its `contents` source when one is embedded (see
+        bun.py's module layout notes), so a module we've edited would
+        otherwise keep running its pre-patch behavior. Zeroing the
+        pointer is the documented "no cache" sentinel (matches how
+        modules with no cache already look) and makes Bun recompile
+        from the now-patched source.
+        """
+        bytecode_field = _bun.MODULE_FIELD_NAMES.index("bytecode")
+        for idx in module_indices:
+            mod = self.ctx.bun.modules[idx]
+            new_base = mod.base + self._shift_past(mod.base, growable)
+            _bun.STRING_POINTER_STRUCT.pack_into(
+                self.buf, new_base + bytecode_field * 8, 0, 0,
+            )
 
     def _shift_past(self, original_offset: int, growable: list[Edit]) -> int:
         """Sum of deltas for growable edits whose entire `old` byte range

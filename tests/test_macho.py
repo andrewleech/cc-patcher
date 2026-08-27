@@ -48,12 +48,18 @@ def _section_64(sectname, segname, addr, size, offset):
     )
 
 
-def build_fixture(js_body: bytes, target_pad: int) -> tuple[bytearray, dict]:
+def build_fixture(
+    js_body: bytes, target_pad: int, bytecode: tuple[int, int] = (0, 0),
+) -> tuple[bytearray, dict]:
     """A minimal but internally consistent Mach-O + Bun payload.
 
     `target_pad` is the number of zero alignment bytes left between the
     end of the Bun payload and the start of `__LINKEDIT`; the JS body is
     space-padded to whatever length makes that come out exact.
+
+    `bytecode` seeds module 0's bytecode StringPointer -- non-zero
+    simulates a `bun build --bytecode` JSC cache, so tests can assert
+    the applier invalidates it when the module's JS text is patched.
     """
     # payload = js | modules table (52) | Offsets (32) | trailer (16)
     overhead = _bun.MODULE_RECORD_SIZE + _bun.OFFSETS_STRUCT.size + len(_bun.TRAILER)
@@ -68,7 +74,7 @@ def build_fixture(js_body: bytes, target_pad: int) -> tuple[bytearray, dict]:
         _bun.STRING_POINTER_STRUCT.pack(0, 0),          # name
         _bun.STRING_POINTER_STRUCT.pack(0, len(js)),    # contents
         _bun.STRING_POINTER_STRUCT.pack(0, 0),          # sourcemap
-        _bun.STRING_POINTER_STRUCT.pack(0, 0),          # bytecode
+        _bun.STRING_POINTER_STRUCT.pack(*bytecode),     # bytecode
         _bun.STRING_POINTER_STRUCT.pack(0, 0),          # module_info
         _bun.STRING_POINTER_STRUCT.pack(0, 0),          # bytecode_origin_path
         bytes([_bun.ENCODING_LATIN1, 0, 0, 0]),
@@ -325,6 +331,44 @@ class MachOSameLengthApplyTests(unittest.TestCase):
         self.assertEqual(len(buf), meta["total_size"])
         self.assertEqual(bytes(buf[:32 + SIZEOFCMDS]), before)
         self.assertEqual(bytes(buf[at:at + 4]), b"CASE")
+
+
+class BytecodeInvalidationTests(unittest.TestCase):
+    """A patched module's JSC bytecode cache must be zeroed, or Bun's
+    standalone runtime keeps executing the pre-patch cached bytecode
+    and ignores the edited `contents` text entirely."""
+
+    def test_same_length_edit_zeroes_the_module_bytecode_pointer(self):
+        buf, meta = build_fixture(JS, target_pad=512, bytecode=(0, 999))
+        ctx = context.parse(buf)
+        self.assertEqual(ctx.bun.modules[0].bytecode, _bun.StringPtr(0, 999))
+        at = buf.index(b"case", meta["js_offset"])
+        plan = EditPlan(edits=[Edit(
+            offset=at, old=b"case", new=b"CASE", patch_name="test",
+        )])
+        context.EditApplier(ctx).apply(plan)
+        reparsed = context.parse(buf)
+        self.assertEqual(reparsed.bun.modules[0].bytecode, _bun.StringPtr(0, 0))
+
+    def test_growable_edit_zeroes_the_module_bytecode_pointer(self):
+        buf, meta = build_fixture(JS, target_pad=512, bytecode=(0, 999))
+        ctx = context.parse(buf)
+        at = buf.index(b"default:", meta["js_offset"])
+        plan = EditPlan(edits=[Edit(
+            offset=at, old=b"default:", new=b'case"local":return A;default:',
+            patch_name="test", grows_region=ctx.containing_string_pointer(at),
+        )])
+        context.EditApplier(ctx).apply(plan)
+        reparsed = context.parse(buf)
+        self.assertEqual(reparsed.bun.modules[0].bytecode, _bun.StringPtr(0, 0))
+
+    def test_untouched_modules_keep_their_bytecode_pointer(self):
+        buf, meta = build_fixture(JS, target_pad=512, bytecode=(0, 999))
+        ctx = context.parse(buf)
+        plan = EditPlan(edits=[])
+        context.EditApplier(ctx).apply(plan)
+        reparsed = context.parse(buf)
+        self.assertEqual(reparsed.bun.modules[0].bytecode, _bun.StringPtr(0, 999))
 
 
 if __name__ == "__main__":
